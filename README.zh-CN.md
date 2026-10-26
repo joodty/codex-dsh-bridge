@@ -132,15 +132,26 @@ powershell -ExecutionPolicy Bypass -File $uninstaller
 
 MCP 进程会在每次工具调用时读取该文件，因此修改地址或启用状态后不需要重启 Codex。可选环境变量 `DSH_BASE_URL` 可以覆盖保存的地址，但 Harness 内的启用开关优先级更高。
 
-## 本机安全边界
+## 目标连接与安全边界
 
-桥接只接受带明确端口的本机 HTTP 地址：
+桥接默认只接受带明确端口的本机 HTTP 地址：
 
 - `127.0.0.1`
 - `localhost`
 - `::1`
 
-HTTPS、局域网地址、账号凭据、URL 路径、查询参数和片段都会被拒绝。
+远程目标必须显式设置 `DSH_ALLOW_REMOTE=true`，在 `DSH_BASE_URL` 中填写 HTTPS 源地址，并选择一种凭据：
+
+- `DSH_BRIDGE_TOKEN`：用户明确提供的 launch token，经 `/connect?interactions=none` 换取 API 凭据；客户端持有同源 WSS 连接，调用 `close()` 后释放。
+- `DSH_BRIDGE_COOKIE`：用户从自己的 launch URL 交换流程中取得的持久浏览器会话 Cookie 请求头。RPC 直接携带该 Cookie，不创建或释放 API peer。
+
+局域网或互联网目标不能使用明文 HTTP。源地址不能包含账号凭据、路径、查询参数或片段。RPC 禁止跳转；认证返回的连接必须指向同源 `/api/remote.mux`。客户端不会查找浏览器 Cookie 或发现远程目标。
+
+原有 `DSH_BRIDGE_CONNECTION_FILE` 仍只支持本机，并锁定完全一致的源地址；不能与 token、Cookie 变量混用。凭据不会写入共享设置文件。
+
+独立派发中心可锁定本仓库的 Git 版本，安装依赖后动态导入 `scripts/dsh-client.mjs`。使用 `new DshClient({ env, configPath })` 传入目标专属环境与明确的配置文件路径，避免读取默认公司配置。地址优先级依次为构造参数 `baseUrl`、`env.DSH_BASE_URL`、指定配置文件、本机默认值；指定配置中的 `enabled: false` 仍会阻止请求。配套插件设置界面继续只管理本机地址。
+
+派发中心可使用导出的 `validateTargetEndpoint(value, { allowRemote: true })` 校验地址，返回值为 URL。异步操作结束后应调用 `client.close()`。
 
 ## 常见问题
 

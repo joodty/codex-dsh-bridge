@@ -2,7 +2,7 @@ import readline from "node:readline";
 import { DshApiError, DshClient } from "./dsh-client.mjs";
 
 const SERVER_NAME = "Codex DSH Bridge";
-const SERVER_VERSION = "0.3.1-company.1";
+const SERVER_VERSION = "0.3.2-hub.1";
 const JSON_RPC_ERRORS = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,

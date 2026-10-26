@@ -132,15 +132,26 @@ When `DSH_HOME` is unset, the fallback location is:
 
 The MCP process reads this file for every tool call, so endpoint and enabled-state changes apply without restarting Codex. The optional `DSH_BASE_URL` environment variable overrides the saved endpoint, while the Harness enabled switch still takes priority.
 
-## Local-only security boundary
+## Target connections and security
 
-The bridge accepts only loopback HTTP origins with an explicit port:
+By default, the bridge accepts only loopback HTTP origins with an explicit port:
 
 - `127.0.0.1`
 - `localhost`
 - `::1`
 
-HTTPS, LAN addresses, credentials, URL paths, query parameters, and fragments are rejected.
+Remote targets require `DSH_ALLOW_REMOTE=true`, an HTTPS origin in `DSH_BASE_URL`, and exactly one credential:
+
+- `DSH_BRIDGE_TOKEN`: an explicitly supplied launch token, exchanged through `/connect?interactions=none`; the client holds a same-origin WSS API peer until `close()`.
+- `DSH_BRIDGE_COOKIE`: a persistent browser-session Cookie header obtained by the user from their launch URL exchange. It is sent directly with RPC calls; no API peer is opened or released.
+
+Plain HTTP to LAN or internet hosts is always rejected. Origins cannot contain credentials, paths, query parameters, or fragments. RPC redirects are rejected, and authentication redirects must point to the same origin's `/api/remote.mux`. The client does not discover browser cookies or remote targets.
+
+The existing `DSH_BRIDGE_CONNECTION_FILE` mode stays local-only and pins the exact origin. Do not combine it with token or cookie variables. No credential is written into the shared settings file.
+
+An independent dispatch hub can pin a Git revision of this repository and dynamically import `scripts/dsh-client.mjs` after installing its dependencies. Pass a target-specific `env` object and an explicit `configPath` to `new DshClient({ env, configPath })`; that path replaces the default company settings path. Endpoint precedence is constructor `baseUrl`, then `env.DSH_BASE_URL`, then the chosen settings file, then the local default. An `enabled: false` value in the chosen settings file still blocks requests. The companion settings UI remains local-only.
+
+`validateTargetEndpoint(value, { allowRemote: true })` is exported for hub configuration validation. It returns a URL. Always call `client.close()` after the asynchronous operation finishes.
 
 ## Troubleshooting
 

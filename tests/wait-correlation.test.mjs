@@ -156,4 +156,85 @@ test("dispatch passes correlation through and keeps substantive text before an e
   const result = await client.dispatch({ text: "task" });
   assert.equal(result.finalAssistantText, "useful answer");
   assert.equal(result.requestId, "target");
+  assert.equal(result.afterSeq, 3);
+});
+
+test("dispatch awaits both admission receipts before prompting and waiting without sending callbacks to RPC", async () => {
+  const client = fakeClient();
+  const steps = [];
+  let receiptCount = 0;
+  client.createSession = async options => {
+    assert.equal(options.onAdmitted, undefined);
+    steps.push("create");
+    return { sessionId: "s" };
+  };
+  client.sendMessage = async options => {
+    assert.equal(options.onAdmitted, undefined);
+    assert.equal(receiptCount, 1);
+    steps.push("prompt");
+    return { accepted: true, afterSeq: 3, requestId: "target" };
+  };
+  client.waitForSession = async options => {
+    assert.equal(options.onAdmitted, undefined);
+    assert.equal(receiptCount, 2);
+    steps.push("wait");
+    return { messages: [], terminalEvents: [], errorEvents: [], status: "completed" };
+  };
+  const admissions = [];
+  const result = await client.dispatch({ text: "task", onAdmitted: async admission => {
+    steps.push("receipt-start");
+    await new Promise(resolve => setImmediate(resolve));
+    admissions.push(admission);
+    receiptCount++;
+    steps.push("receipt-end");
+  } });
+  assert.deepEqual(admissions, [{ sessionId: "s" }, { sessionId: "s", requestId: "target", afterSeq: 3 }]);
+  assert.deepEqual(steps, ["create", "receipt-start", "receipt-end", "prompt", "receipt-start", "receipt-end", "wait"]);
+  assert.equal(result.afterSeq, 3);
+});
+
+test("admission failures stop dispatch before the next backend operation and retain known identities", async () => {
+  for (const failingReceipt of [1, 2]) {
+    const client = fakeClient();
+    let prompts = 0;
+    let waits = 0;
+    let receipts = 0;
+    client.createSession = async () => ({ sessionId: "recoverable" });
+    client.sendMessage = async () => { prompts++; return { requestId: "target", afterSeq: 9 }; };
+    client.waitForSession = async () => { waits++; };
+    await assert.rejects(client.dispatch({ text: "task", onAdmitted: async () => {
+      receipts++;
+      if (receipts === failingReceipt) throw new Error("disk failure secret");
+    } }), error => {
+      assert.equal(error.code, "admission-callback-failed");
+      assert.deepEqual(error.details.admission, failingReceipt === 1 ? { sessionId: "recoverable" }
+        : { sessionId: "recoverable", requestId: "target", afterSeq: 9 });
+      assert.ok(!error.message.includes("secret"));
+      return true;
+    });
+    assert.equal(prompts, failingReceipt - 1);
+    assert.equal(waits, 0);
+  }
+  const client = fakeClient();
+  client.createSession = async () => assert.fail("Invalid callback must fail before creating a session");
+  await assert.rejects(client.dispatch({ text: "task", onAdmitted: true }), { code: "invalid-argument" });
+});
+
+test("dispatch retains admitted session identity when prompt or wait loses its connection", async () => {
+  for (const failAt of ["sendMessage", "waitForSession"]) {
+    const client = fakeClient();
+    const receipts = [];
+    client.createSession = async () => ({ sessionId: "recoverable" });
+    client.sendMessage = async () => ({ requestId: "target", afterSeq: 9 });
+    client[failAt] = async () => { throw new Error("lost transport"); };
+    await assert.rejects(client.dispatch({ text: "task", onAdmitted: async receipt => receipts.push(receipt) }), error => {
+      assert.equal(error.details.admission.sessionId, "recoverable");
+      assert.equal(receipts[0].sessionId, "recoverable");
+      if (failAt === "waitForSession") {
+        assert.equal(receipts[1].requestId, "target");
+        assert.equal(error.details.admission.afterSeq, 9);
+      }
+      return true;
+    });
+  }
 });

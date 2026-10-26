@@ -1,6 +1,21 @@
 import { readFileSync } from "node:fs";
 import WebSocket from "ws";
 
+function redact(value, secrets) {
+  if (typeof value === "string") {
+    for (const secret of secrets) if (secret) value = value.replaceAll(secret, "[redacted]");
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(item => redact(item, secrets));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value)
+    .map(([key, item]) => [redact(key, secrets), redact(item, secrets)]));
+  return value;
+}
+
+function cookieSecrets(cookie) {
+  return [cookie, ...cookie.split(";").map(part => part.slice(part.indexOf("=") + 1).trim()).filter(Boolean)];
+}
+
 // Pin the exact company desktop file via env; never search browser profiles or remote hosts.
 export function readLocalConnection(path, validateBaseUrl) {
   let value;
@@ -13,36 +28,78 @@ export function readLocalConnection(path, validateBaseUrl) {
 }
 
 export class LocalApiConnection {
-  constructor(connection) { this.connection = connection; }
+  #connection;
+  #socket;
+  #generation = 0;
+  #secrets;
+  #fetch;
+  #WebSocket;
+  #pending;
+  constructor(connection, { fetchImpl = fetch, WebSocketImpl = WebSocket } = {}) {
+    this.#connection = connection;
+    this.#secrets = [connection.token];
+    this.#fetch = fetchImpl;
+    this.#WebSocket = WebSocketImpl;
+  }
+  redact(value) { return redact(value, this.#secrets); }
   async headers() {
-    if (!this.pending) this.pending = this.connect().catch(error => { this.pending = undefined; throw error; });
-    return this.pending;
+    if (!this.#pending) {
+      const pending = this.connect().catch(error => {
+        if (this.#pending === pending) this.#pending = undefined;
+        throw error;
+      });
+      this.#pending = pending;
+    }
+    return this.#pending;
   }
   async connect() {
-    const url = new URL("/connect", this.connection.baseUrl);
-    url.searchParams.set("token", this.connection.token);
+    const generation = this.#generation;
+    const url = new URL("/connect", this.#connection.baseUrl);
+    url.searchParams.set("token", this.#connection.token);
     url.searchParams.set("interactions", "none");
     let response;
     try {
-      response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(10000) });
-    } catch { throw new Error("Cannot authenticate to the local company DSH desktop. It may have restarted; retry the call."); }
-    if (response.status !== 302) throw new Error(`Local DSH API authentication failed (HTTP ${response.status}).`);
+      response = await this.#fetch(url, { redirect: "manual", signal: AbortSignal.timeout(10000) });
+    } catch { throw new Error("Cannot authenticate to DSH. The service may have restarted; retry the call."); }
+    if (response.status !== 302) throw new Error(`DSH API authentication failed (HTTP ${response.status}).`);
     const cookie = response.headers.getSetCookie().map(value => value.split(";", 1)[0]).join("; ");
+    this.#secrets.push(...cookieSecrets(cookie));
     const location = response.headers.get("location");
     if (!cookie || !location) throw new Error("DSH API authentication response is incomplete.");
-    const wsUrl = new URL(location, this.connection.baseUrl);
-    if (wsUrl.origin.replace(/^ws/, "http") !== this.connection.baseUrl.origin || wsUrl.pathname !== "/api/remote.mux") {
+    let wsUrl;
+    try { wsUrl = new URL(location, this.#connection.baseUrl); }
+    catch { throw new Error("DSH API returned an unexpected connection target."); }
+    const expectedProtocol = this.#connection.baseUrl.protocol === "https:" ? "wss:" : "ws:";
+    const httpOrigin = wsUrl.protocol === "wss:" || wsUrl.protocol === "ws:"
+      ? wsUrl.origin.replace(/^ws/, "http") : wsUrl.origin;
+    if (httpOrigin !== this.#connection.baseUrl.origin || wsUrl.pathname !== "/api/remote.mux"
+      || wsUrl.username || wsUrl.password || wsUrl.hash
+      || ![this.#connection.baseUrl.protocol, expectedProtocol].includes(wsUrl.protocol)) {
       throw new Error("DSH API returned an unexpected connection target.");
     }
-    wsUrl.protocol = "ws:";
+    wsUrl.protocol = expectedProtocol;
+    if (generation !== this.#generation) throw new Error("DSH API connection was closed.");
     await new Promise((resolve, reject) => {
-      const socket = new WebSocket(wsUrl, { headers: { cookie }, handshakeTimeout: 10000 });
-      this.socket = socket;
+      const socket = new this.#WebSocket(wsUrl, { headers: { cookie }, handshakeTimeout: 10000 });
+      this.#socket = socket;
       socket.once("open", resolve);
-      socket.on("error", () => reject(new Error("Local DSH API lifecycle socket failed.")));
-      socket.on("close", () => { this.pending = undefined; });
+      socket.on("error", () => reject(new Error("DSH API lifecycle socket failed.")));
+      socket.on("close", () => {
+        if (this.#socket === socket) { this.#socket = undefined; this.#pending = undefined; }
+        reject(new Error("DSH API lifecycle socket closed before connecting."));
+      });
     });
     return { cookie };
   }
-  close() { this.socket?.terminate(); this.pending = undefined; }
+  close() { this.#generation++; this.#socket?.terminate(); this.#socket = undefined; this.#pending = undefined; }
+}
+
+// A persistent browser-session cookie has no API-peer lifecycle. Closing this
+// wrapper must not open or release an API connection on the target service.
+export class CookieApiConnection {
+  #cookie;
+  constructor(cookie) { this.#cookie = cookie; }
+  redact(value) { return redact(value, cookieSecrets(this.#cookie)); }
+  async headers() { return { cookie: this.#cookie }; }
+  close() {}
 }

@@ -1,6 +1,6 @@
 {
   "name": "codex-dsh-bridge-companion",
-  "version": "0.3.1-company.1",
+  "version": "0.3.2-hub.1",
   "type": "module",
   "description": "DeepSeek Harness companion for the Codex DSH Bridge.",
   "main": "./dsh-plugin/lib/index.js",

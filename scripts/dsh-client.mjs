@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { LocalApiConnection, readLocalConnection } from "./local-auth.mjs";
+import { join, resolve, posix, win32 } from "node:path";
+import { CookieApiConnection, LocalApiConnection, readLocalConnection } from "./local-auth.mjs";
 import { rc3Describe, rc3History, rc3ListSessions, rc3RpcRequest } from "./dsh-rc3.mjs";
 
 export const DEFAULT_BASE_URL = "http://127.0.0.1:3080";
@@ -14,6 +14,8 @@ const MAX_WAIT_TIMEOUT_MS = 300_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const MAX_TEXT_LENGTH = 24_000;
+const MAX_ARTIFACT_LINES = 100;
+const MAX_ARTIFACT_TEXT_BYTES = 128 * 1024;
 
 export class DshApiError extends Error {
   constructor(message, { code = "dsh-api-error", details, cause } = {}) {
@@ -99,10 +101,9 @@ export function readBridgeConfig({
   let value;
   try {
     value = JSON.parse(raw);
-  } catch (error) {
+  } catch {
     throw new DshApiError(`Codex DSH Bridge config is not valid JSON: ${configPath}`, {
       code: "invalid-bridge-config",
-      cause: error,
       details: { configPath },
     });
   }
@@ -128,27 +129,24 @@ export function readBridgeConfig({
   return value;
 }
 
-export function resolveBaseUrl(rawValue = DEFAULT_BASE_URL) {
+export function validateTargetEndpoint(rawValue = DEFAULT_BASE_URL, { allowRemote = false } = {}) {
   let url;
   try {
     url = new URL(rawValue);
-  } catch (error) {
+  } catch {
     throw new DshApiError("DSH_BASE_URL must be a valid URL.", {
       code: "invalid-base-url",
-      cause: error,
     });
   }
 
-  if (url.protocol !== "http:") {
-    throw new DshApiError("DSH_BASE_URL must use http:// for the local DSH service.", {
+  if (url.protocol !== "http:" && !(allowRemote === true && url.protocol === "https:")) {
+    throw new DshApiError("DSH_BASE_URL requires loopback HTTP, or HTTPS with DSH_ALLOW_REMOTE=true.", {
       code: "invalid-base-url",
-      details: { protocol: url.protocol },
     });
   }
-  if (!ALLOWED_HOSTS.has(url.hostname.toLowerCase())) {
-    throw new DshApiError("DSH_BASE_URL must point to localhost or a loopback address.", {
+  if (url.protocol === "http:" && !ALLOWED_HOSTS.has(url.hostname.toLowerCase())) {
+    throw new DshApiError("Plain HTTP DSH_BASE_URL must point to localhost or a loopback address.", {
       code: "non-loopback-base-url",
-      details: { hostname: url.hostname },
     });
   }
   if (url.username || url.password || url.search || url.hash) {
@@ -156,14 +154,18 @@ export function resolveBaseUrl(rawValue = DEFAULT_BASE_URL) {
       code: "invalid-base-url",
     });
   }
-  if (url.pathname !== "/" || !url.port) {
-    throw new DshApiError("DSH_BASE_URL must be a loopback origin with an explicit port.", {
+  if (url.pathname !== "/" || (url.protocol === "http:" && !url.port)) {
+    throw new DshApiError("DSH_BASE_URL must be an origin; loopback HTTP requires an explicit port.", {
       code: "invalid-base-url",
-      details: { pathname: url.pathname, port: url.port },
     });
   }
 
   return url;
+}
+
+// Keep the legacy local-only validator available to connection-file callers.
+export function resolveBaseUrl(rawValue = DEFAULT_BASE_URL) {
+  return validateTargetEndpoint(rawValue);
 }
 
 export function resolveBridgeRuntimeConfig({
@@ -188,7 +190,7 @@ export function resolveBridgeRuntimeConfig({
 
   return {
     enabled: true,
-    baseUrl: resolveBaseUrl(selectedBaseUrl),
+    baseUrl: validateTargetEndpoint(selectedBaseUrl, { allowRemote: env.DSH_ALLOW_REMOTE === "true" }),
     configPath,
     source: baseUrl !== undefined
       ? "constructor"
@@ -300,11 +302,25 @@ export class DshClient {
   } = {}) {
     const connectionPath = env.DSH_BRIDGE_CONNECTION_FILE;
     const connection = connectionPath ? readLocalConnection(connectionPath, resolveBaseUrl) : null;
-    if (connection && baseUrl !== undefined && resolveBaseUrl(baseUrl).origin !== connection.baseUrl.origin) {
+    const validate = value => validateTargetEndpoint(value, { allowRemote: env.DSH_ALLOW_REMOTE === "true" });
+    if (connection && baseUrl !== undefined && validate(baseUrl).origin !== connection.baseUrl.origin) {
       throw new DshApiError("Explicit endpoint does not match the pinned local DSH connection.", { code: "connection-mismatch" });
     }
-    if (connection && env.DSH_BASE_URL && resolveBaseUrl(env.DSH_BASE_URL).origin !== connection.baseUrl.origin) {
+    if (connection && env.DSH_BASE_URL && validate(env.DSH_BASE_URL).origin !== connection.baseUrl.origin) {
       throw new DshApiError("Environment endpoint does not match the pinned local DSH connection.", { code: "connection-mismatch" });
+    }
+    const token = env.DSH_BRIDGE_TOKEN;
+    const cookie = env.DSH_BRIDGE_COOKIE;
+    if ((token !== undefined && cookie !== undefined) || (connection && (token !== undefined || cookie !== undefined))) {
+      throw new DshApiError("Choose one DSH authentication mode: connection file, launch token, or browser cookie.", { code: "invalid-auth-config" });
+    }
+    for (const value of [token, cookie]) {
+      if (value !== undefined && (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))) {
+        throw new DshApiError("DSH credentials must be non-empty strings without control characters.", { code: "invalid-auth-config" });
+      }
+    }
+    if (cookie !== undefined && !cookie.split(";").every(part => /^[^=\s;,]+=[^;]*$/.test(part.trim()))) {
+      throw new DshApiError("DSH_BRIDGE_COOKIE must contain Cookie header name=value pairs.", { code: "invalid-auth-config" });
     }
     if (connection) baseUrl = connection.baseUrl.origin;
     const runtimeConfig = resolveBridgeRuntimeConfig({ baseUrl, env, configPath });
@@ -312,14 +328,21 @@ export class DshClient {
     this.configPath = runtimeConfig.configPath;
     this.configSource = runtimeConfig.source;
     this.requestTimeoutMs = asInteger(requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 60_000);
-    this.localAuth = connection ? new LocalApiConnection(connection) : null;
+    if (this.baseUrl.protocol === "https:" && token === undefined && cookie === undefined) {
+      throw new DshApiError("HTTPS DSH targets require DSH_BRIDGE_TOKEN or DSH_BRIDGE_COOKIE.", { code: "missing-auth-config" });
+    }
+    this.localAuth = connection ? new LocalApiConnection(connection)
+      : cookie !== undefined ? new CookieApiConnection(cookie)
+        : token !== undefined ? new LocalApiConnection({ baseUrl: this.baseUrl, token }) : null;
     if (connection) this.configSource = "company-desktop-companion";
   }
 
   close() { this.localAuth?.close(); }
 
   async rpc(method, payload = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
-    if (this.localAuth) ({ method, payload } = rc3RpcRequest(method, payload));
+    if (this.localAuth || method === "workspaceFiles.read" || method === "workspaceFiles/read") {
+      ({ method, payload } = rc3RpcRequest(method, payload));
+    }
     const rpcId = this.localAuth && method === "session/prompt"
       ? payload.args.request.requestId
       : randomUUID();
@@ -332,6 +355,7 @@ export class DshClient {
       response = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json", ...(this.localAuth ? await this.localAuth.headers() : {}) },
+        redirect: "error",
         body: JSON.stringify({
           type: "client-request",
           rpcId,
@@ -345,10 +369,9 @@ export class DshClient {
       throw new DshApiError(
         timedOut
           ? `DSH request timed out after ${timeoutMs} ms.`
-          : `Cannot reach DSH at ${this.baseUrl.origin}. Start "npx @deepseek-ai/dsh web" first.`,
+          : `Cannot reach or authenticate to DSH at ${this.baseUrl.origin}. Check the service and target credentials.`,
         {
           code: timedOut ? "request-timeout" : "connection-failed",
-          cause: error,
           details: { baseUrl: this.baseUrl.origin },
         },
       );
@@ -356,35 +379,38 @@ export class DshClient {
       clearTimeout(timer);
     }
 
-    const rawText = await response.text();
+    let rawText;
+    try { rawText = await response.text(); }
+    catch {
+      throw new DshApiError("Cannot read the DSH response.", { code: "invalid-response" });
+    }
     let body;
     try {
       body = JSON.parse(rawText);
     } catch (error) {
       throw new DshApiError(`DSH returned non-JSON HTTP ${response.status}.`, {
         code: "invalid-response",
-        cause: error,
-        details: { status: response.status, body: truncateText(rawText, 2_000) },
+        details: { status: response.status },
       });
     }
 
     if (!response.ok) {
       throw new DshApiError(`DSH returned HTTP ${response.status}.`, {
         code: "http-error",
-        details: { status: response.status, body },
+        details: { status: response.status },
       });
     }
     if (body?.type !== "server-response" || body.rpcId !== rpcId) {
       throw new DshApiError("DSH returned an invalid RPC envelope.", {
         code: "invalid-response",
-        details: { body },
       });
     }
     if (body?.result?.ok !== true) {
       const error = body?.result?.error ?? {};
-      throw new DshApiError(error.message ?? "DSH RPC failed.", {
-        code: error.code ?? "dsh-rpc-error",
-        details: error.details ?? {},
+      const clean = this.localAuth?.redact?.(error) ?? error;
+      throw new DshApiError(clean.message ?? "DSH RPC failed.", {
+        code: clean.code ?? "dsh-rpc-error",
+        details: clean.details ?? {},
       });
     }
     return body.result.value;
@@ -476,6 +502,34 @@ export class DshClient {
     return this.rpc("session.cancel", {
       sessionId: asNonEmptyString(sessionId, "sessionId"),
     });
+  }
+
+  async readArtifact({ sessionId, path }) {
+    const normalizedSessionId = asNonEmptyString(sessionId, "sessionId");
+    const relativePath = asNonEmptyString(path, "path").replaceAll("\\", "/");
+    if (relativePath.length > 2048 || posix.isAbsolute(relativePath) || win32.isAbsolute(relativePath)
+      || /[:\x00-\x1f\x7f]/.test(relativePath)
+      || relativePath.split("/").some(part => part === ".." || part === "." || part === "")) {
+      throw new DshApiError("Artifact path must be a clean relative file path without traversal.", { code: "invalid-argument" });
+    }
+    // Official rc.3 workspaceFiles/read uses one-based line windows and a
+    // lookup argument named workspaceFileScopeId, rather than a request object.
+    const page = await this.rpc("workspaceFiles.read", {
+      sessionId: normalizedSessionId, path: relativePath, range: { offset: 1, limit: MAX_ARTIFACT_LINES },
+    });
+    if (!page || typeof page.text !== "string" || page.offset !== 1
+      || !Number.isInteger(page.lines) || page.lines < 0 || page.lines > MAX_ARTIFACT_LINES
+      || typeof page.eof !== "boolean" || typeof page.absolutePath !== "string" || typeof page.version !== "string") {
+      throw new DshApiError("DSH returned an invalid artifact page.", { code: "invalid-response" });
+    }
+    if (Buffer.byteLength(page.text, "utf8") > MAX_ARTIFACT_TEXT_BYTES) {
+      throw new DshApiError("Artifact page exceeds the 128 KiB bridge read limit.", { code: "artifact-too-large" });
+    }
+    return {
+      sessionId: normalizedSessionId, path: relativePath, absolutePath: page.absolutePath,
+      version: page.version, offset: page.offset, text: page.text, lines: page.lines, eof: page.eof,
+      ...(Number.isSafeInteger(page.bytes) && page.bytes >= 0 ? { bytes: page.bytes } : {}),
+    };
   }
 
   forkSession({ sessionId, atSeq }) {
@@ -589,38 +643,66 @@ export class DshClient {
     timeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     clientTimeZone = "Asia/Shanghai",
+    onAdmitted,
   }) {
+    if (onAdmitted !== undefined && typeof onAdmitted !== "function") {
+      throw new DshApiError("onAdmitted must be a function.", { code: "invalid-argument" });
+    }
     const created = await this.createSession({ cwd, workspaceId, agentPreset });
-    const sent = await this.sendMessage({
-      sessionId: created.sessionId,
-      text,
-      mode: "queue",
-      clientTimeZone,
-    });
-    const waited = await this.waitForSession({
-      sessionId: created.sessionId,
-      afterSeq: sent.afterSeq,
-      ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
-      timeoutMs,
-      pollIntervalMs,
-    });
-    const finalAssistantMessage = [...waited.messages]
-      .reverse()
-      .find((message) => message.role === "assistant" && message.text?.trim().length > 0);
-    return {
-      sessionId: created.sessionId,
-      agentPreset: created.agentPreset ?? agentPreset,
-      accepted: sent.accepted,
-      ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
-      status: waited.status,
-      completed: waited.completed,
-      timedOut: waited.timedOut,
-      finalAssistantText: finalAssistantMessage?.text ?? null,
-      messages: waited.messages,
-      terminalEvents: waited.terminalEvents,
-      errorEvents: waited.errorEvents,
-      latestSeq: waited.latestSeq,
-      session: waited.session,
+    const admission = { sessionId: created.sessionId };
+    const notifyAdmission = async () => {
+      if (!onAdmitted) return;
+      try { await onAdmitted({ ...admission }); }
+      catch {
+        throw new DshApiError("Cannot persist the DSH admission receipt.", {
+          code: "admission-callback-failed", details: { admission: { ...admission } },
+        });
+      }
     };
+    try {
+      await notifyAdmission();
+      const sent = await this.sendMessage({
+        sessionId: created.sessionId,
+        text,
+        mode: "queue",
+        clientTimeZone,
+      });
+      Object.assign(admission, { requestId: sent.requestId, afterSeq: sent.afterSeq });
+      await notifyAdmission();
+      const waited = await this.waitForSession({
+        sessionId: created.sessionId,
+        afterSeq: sent.afterSeq,
+        ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
+        timeoutMs,
+        pollIntervalMs,
+      });
+      const finalAssistantMessage = [...waited.messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.text?.trim().length > 0);
+      return {
+        sessionId: created.sessionId,
+        agentPreset: created.agentPreset ?? agentPreset,
+        accepted: sent.accepted,
+        afterSeq: sent.afterSeq,
+        ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
+        status: waited.status,
+        completed: waited.completed,
+        timedOut: waited.timedOut,
+        finalAssistantText: finalAssistantMessage?.text ?? null,
+        messages: waited.messages,
+        terminalEvents: waited.terminalEvents,
+        errorEvents: waited.errorEvents,
+        latestSeq: waited.latestSeq,
+        session: waited.session,
+      };
+    } catch (error) {
+      if (error instanceof DshApiError) {
+        error.details = { ...error.details, admission: { ...admission } };
+        throw error;
+      }
+      throw new DshApiError("DSH dispatch failed after session creation.", {
+        code: "dispatch-failed", details: { admission: { ...admission } },
+      });
+    }
   }
 }

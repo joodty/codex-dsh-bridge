@@ -9,6 +9,13 @@ function invalidResponse(message) {
 /** Translate the bridge's flat calls to rc3's named Typert arguments. */
 export function rc3RpcRequest(method, payload = {}) {
   const endpoint = method.replaceAll(".", "/");
+  if (endpoint === "workspaceFiles/read") {
+    return { method: endpoint, payload: { args: {
+      workspaceFileScopeId: payload.sessionId,
+      path: payload.path,
+      range: payload.range,
+    } } };
+  }
   if (endpoint === "session/modelCatalog") {
     return { method: endpoint, payload: { args: {} } };
   }
