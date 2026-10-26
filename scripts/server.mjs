@@ -2,7 +2,7 @@ import readline from "node:readline";
 import { DshApiError, DshClient } from "./dsh-client.mjs";
 
 const SERVER_NAME = "Codex DSH Bridge";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.1-company.1";
 const JSON_RPC_ERRORS = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,
@@ -91,6 +91,7 @@ const tools = [
       properties: {
         sessionId: { type: "string" },
         afterSeq: { type: "integer", minimum: -1, default: -1, description: "Usually use afterSeq returned by dsh_send_message." },
+        requestId: { type: "string", description: "Use requestId returned by dsh_send_message to wait for that task when the session is busy." },
         timeoutMs: { type: "integer", minimum: 1000, maximum: 300000, default: 60000 },
         pollIntervalMs: { type: "integer", minimum: 1000, maximum: 5000, default: 2000 },
       },
@@ -183,6 +184,7 @@ function toolResult(value, { isError = false } = {}) {
 
 async function callTool(name, args = {}) {
   const client = new DshClient();
+  try {
   switch (name) {
     case "dsh_status":
       return {
@@ -197,24 +199,25 @@ async function callTool(name, args = {}) {
         sessions: await client.listSessions(args),
       };
     case "dsh_create_session":
-      return client.createSession(args);
+      return await client.createSession(args);
     case "dsh_send_message":
-      return client.sendMessage(args);
+      return await client.sendMessage(args);
     case "dsh_get_messages":
-      return client.getMessages(args);
+      return await client.getMessages(args);
     case "dsh_wait":
-      return client.waitForSession(args);
+      return await client.waitForSession(args);
     case "dsh_cancel":
-      return client.cancelSession(args);
+      return await client.cancelSession(args);
     case "dsh_fork_session":
-      return client.forkSession(args);
+      return await client.forkSession(args);
     case "dsh_dispatch":
-      return client.dispatch(args);
+      return await client.dispatch(args);
     default:
       throw new DshApiError(`Unknown tool: ${name ?? ""}`, {
         code: "unknown-tool",
       });
   }
+  } finally { client.close(); }
 }
 
 async function handleRequest(message) {

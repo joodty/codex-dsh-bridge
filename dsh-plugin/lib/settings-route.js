@@ -1,13 +1,12 @@
 import {
   SettingsConflictError,
-  settingsNamespace,
 } from "@deepseek-ai/dsh-settings";
 import { normalizeBridgeConfig } from "./config.js";
 
 export const SETTINGS_ROUTE_PATH = "/plugins/codex-dsh-bridge-companion/settings";
 export const MAX_SETTINGS_BODY_BYTES = 4096;
 
-const BRIDGE_SETTINGS_NAMESPACE = settingsNamespace("codex-dsh-bridge");
+const BRIDGE_SETTINGS_NAMESPACE = "codex-dsh-bridge";
 
 function writeJson(res, status, body, extraHeaders = {}) {
   const payload = `${JSON.stringify(body)}\n`;

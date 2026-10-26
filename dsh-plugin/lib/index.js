@@ -1,8 +1,8 @@
 import z from "@deepseek-ai/schemastery";
+import { publishConnection } from "./local-connection.js";
 import {
   DEFAULT_BASE_URL,
   normalizeBridgeConfig,
-  resolveBridgeConfigPath,
   writeBridgeConfigAtomic,
 } from "./config.js";
 import {
@@ -16,45 +16,28 @@ export const BridgeSettingsSchema = z.object({
   baseUrl: z.string().default(DEFAULT_BASE_URL),
 });
 
-function reportWriteFailure(ctx, configPath, error) {
-  ctx.logger.warn(`codex-dsh-bridge: failed to write shared config at ${configPath}`);
-  ctx.logger.warn(error);
-}
+// rc3 derives settings from each plugin's Config and reloads it on edits.
+export const Config = BridgeSettingsSchema;
+export const inject = ["settings", "webServer", "connection"];
 
-export function apply(ctx) {
-  ctx.inject(["settings", "webServer"], (settingsCtx) => {
-    const configPath = resolveBridgeConfigPath();
-    const scope = settingsCtx.settings.register(
-      SETTINGS_NAMESPACE,
-      BridgeSettingsSchema,
-      {
-        applies: "live",
-        validate: normalizeBridgeConfig,
-      },
-    );
-
-    let writeTail = Promise.resolve();
-    const persist = (value) => {
-      writeTail = writeTail
-        .then(() => writeBridgeConfigAtomic(value, { configPath }))
-        .catch((error) => {
-          reportWriteFailure(settingsCtx, configPath, error);
-        });
-      return writeTail;
-    };
-
-    void persist(scope.get());
-    settingsCtx.effect(
-      () => scope.watch((next) => persist(next)),
-      "codex-dsh-bridge: mirror Harness settings to shared config",
-    );
-    settingsCtx.effect(
-      () => settingsCtx.webServer.register({
-        kind: "exact",
-        path: SETTINGS_ROUTE_PATH,
-        handler: createSettingsRouteHandler(settingsCtx.settings),
-      }),
-      "codex-dsh-bridge: settings HTTP route",
-    );
-  });
+export function apply(ctx, config) {
+  const value = normalizeBridgeConfig(config ?? {});
+  ctx.effect(async () => {
+    await writeBridgeConfigAtomic({ ...value, baseUrl: ctx.webServer.getOrigin() });
+    return value.enabled ? publishConnection(ctx) : undefined;
+  }, "codex-dsh-bridge: publish authenticated local desktop connection");
+  const handleSettings = createSettingsRouteHandler(ctx.settings);
+  ctx.effect(() => ctx.webServer.register({
+    kind: "exact",
+    path: SETTINGS_ROUTE_PATH,
+    handler: (request, response) => {
+      const admission = ctx.connection.admit(request);
+      if ("rejection" in admission || admission.peer.principal.kind !== "owner") {
+        response.writeHead(admission.rejection ?? 403);
+        response.end("unauthorized");
+        return;
+      }
+      return handleSettings(request, response);
+    },
+  }), "codex-dsh-bridge: authenticated settings route");
 }

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { LocalApiConnection, readLocalConnection } from "./local-auth.mjs";
+import { rc3Describe, rc3History, rc3ListSessions, rc3RpcRequest } from "./dsh-rc3.mjs";
 
 export const DEFAULT_BASE_URL = "http://127.0.0.1:3080";
 export const BRIDGE_CONFIG_FILENAME = "codex-dsh-bridge.json";
@@ -242,6 +244,7 @@ export function summarizeHistory(history, { afterSeq = -1 } = {}) {
         role: "user",
         text: contentToText(event.data?.content),
         id: event.data?.id ?? null,
+        requestId: event.data?.source?.rpcId ?? null,
       });
       continue;
     }
@@ -295,16 +298,32 @@ export class DshClient {
     env = process.env,
     configPath = resolveConfigPath({ env }),
   } = {}) {
+    const connectionPath = env.DSH_BRIDGE_CONNECTION_FILE;
+    const connection = connectionPath ? readLocalConnection(connectionPath, resolveBaseUrl) : null;
+    if (connection && baseUrl !== undefined && resolveBaseUrl(baseUrl).origin !== connection.baseUrl.origin) {
+      throw new DshApiError("Explicit endpoint does not match the pinned local DSH connection.", { code: "connection-mismatch" });
+    }
+    if (connection && env.DSH_BASE_URL && resolveBaseUrl(env.DSH_BASE_URL).origin !== connection.baseUrl.origin) {
+      throw new DshApiError("Environment endpoint does not match the pinned local DSH connection.", { code: "connection-mismatch" });
+    }
+    if (connection) baseUrl = connection.baseUrl.origin;
     const runtimeConfig = resolveBridgeRuntimeConfig({ baseUrl, env, configPath });
     this.baseUrl = runtimeConfig.baseUrl;
     this.configPath = runtimeConfig.configPath;
     this.configSource = runtimeConfig.source;
     this.requestTimeoutMs = asInteger(requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 60_000);
+    this.localAuth = connection ? new LocalApiConnection(connection) : null;
+    if (connection) this.configSource = "company-desktop-companion";
   }
 
+  close() { this.localAuth?.close(); }
+
   async rpc(method, payload = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
-    const rpcId = randomUUID();
-    const endpoint = new URL(`/api/${encodeURIComponent(asNonEmptyString(method, "method"))}`, this.baseUrl);
+    if (this.localAuth) ({ method, payload } = rc3RpcRequest(method, payload));
+    const rpcId = this.localAuth && method === "session/prompt"
+      ? payload.args.request.requestId
+      : randomUUID();
+    const endpoint = new URL(`/api/${asNonEmptyString(method, "method").split("/").map(encodeURIComponent).join("/")}`, this.baseUrl);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -312,7 +331,7 @@ export class DshClient {
     try {
       response = await fetch(endpoint, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...(this.localAuth ? await this.localAuth.headers() : {}) },
         body: JSON.stringify({
           type: "client-request",
           rpcId,
@@ -372,11 +391,12 @@ export class DshClient {
   }
 
   describe() {
+    if (this.localAuth) return rc3Describe(this);
     return this.rpc("host.describe", {});
   }
 
   async listSessions({ cwd, title, running } = {}) {
-    const value = await this.rpc("session.list", {});
+    const value = this.localAuth ? await rc3ListSessions(this) : await this.rpc("session.list", {});
     let items = Array.isArray(value?.items) ? value.items : [];
 
     if (typeof cwd === "string" && cwd.trim().length > 0) {
@@ -415,7 +435,9 @@ export class DshClient {
         code: "invalid-argument",
       });
     }
+    const requestId = this.localAuth ? randomUUID() : undefined;
     const value = await this.rpc("session.prompt", {
+      ...(requestId === undefined ? {} : { requestId }),
       sessionId: asNonEmptyString(sessionId, "sessionId"),
       mode,
       content: [{ type: "text", text: asNonEmptyString(text, "text") }],
@@ -426,10 +448,11 @@ export class DshClient {
       sessionId,
       mode,
       afterSeq: before.latestSeq,
+      ...(requestId === undefined ? {} : { requestId }),
     };
   }
 
-  async getMessages({ sessionId, beforeSeq, maxMessages = 30, afterSeq = -1 }) {
+  async getMessages({ sessionId, beforeSeq, maxMessages = 30, afterSeq = -1, requestId }) {
     const payload = {
       sessionId: asNonEmptyString(sessionId, "sessionId"),
       maxMessages: asInteger(maxMessages, 30, 1, MAX_HISTORY_MESSAGES),
@@ -437,11 +460,14 @@ export class DshClient {
     if (beforeSeq !== undefined) {
       payload.beforeSeq = asInteger(beforeSeq, undefined, 0, Number.MAX_SAFE_INTEGER);
     }
-    const history = await this.rpc("session.history", payload);
+    const normalizedAfterSeq = asInteger(afterSeq, -1, -1, Number.MAX_SAFE_INTEGER);
+    const history = this.localAuth
+      ? await rc3History(this, { ...payload, afterSeq: normalizedAfterSeq, requestId })
+      : await this.rpc("session.history", payload);
     return {
       sessionId,
       ...summarizeHistory(history, {
-        afterSeq: asInteger(afterSeq, -1, -1, Number.MAX_SAFE_INTEGER),
+        afterSeq: normalizedAfterSeq,
       }),
     };
   }
@@ -463,11 +489,15 @@ export class DshClient {
   async waitForSession({
     sessionId,
     afterSeq = -1,
+    requestId,
     timeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   }) {
     const normalizedSessionId = asNonEmptyString(sessionId, "sessionId");
     const normalizedAfterSeq = asInteger(afterSeq, -1, -1, Number.MAX_SAFE_INTEGER);
+    const normalizedRequestId = requestId === undefined
+      ? undefined
+      : asNonEmptyString(requestId, "requestId");
     const normalizedTimeoutMs = asInteger(timeoutMs, DEFAULT_WAIT_TIMEOUT_MS, 1_000, MAX_WAIT_TIMEOUT_MS);
     const normalizedPollMs = asInteger(pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, 1_000, 5_000);
     const deadline = Date.now() + normalizedTimeoutMs;
@@ -475,12 +505,13 @@ export class DshClient {
     let session = null;
 
     while (true) {
-      const [sessions, messages] = await Promise.all([
+      const [sessions, history] = await Promise.all([
         this.listSessions(),
         this.getMessages({
           sessionId: normalizedSessionId,
           maxMessages: MAX_HISTORY_MESSAGES,
           afterSeq: normalizedAfterSeq,
+          ...(normalizedRequestId === undefined ? {} : { requestId: normalizedRequestId }),
         }),
       ]);
       session = sessions.find((item) => item.sessionId === normalizedSessionId) ?? null;
@@ -489,6 +520,25 @@ export class DshClient {
           code: "session-not-found",
           details: { sessionId: normalizedSessionId },
         });
+      }
+      // Queue admission can precede the end of an unrelated active turn. The
+      // durable user event is written when this request actually reaches the
+      // Agent, so only a terminal after that event can complete this request.
+      let messages = history;
+      if (normalizedRequestId !== undefined) {
+        const submitted = history.messages.find(message => message.role === "user"
+          && message.requestId === normalizedRequestId);
+        const terminal = submitted === undefined ? undefined
+          : history.terminalEvents.find(event => event.seq > submitted.seq);
+        const belongsToRequest = event => submitted !== undefined
+          && event.seq >= submitted.seq && (terminal === undefined || event.seq <= terminal.seq);
+        messages = {
+          ...history,
+          requestId: normalizedRequestId,
+          messages: history.messages.filter(belongsToRequest),
+          terminalEvents: terminal === undefined ? [] : [terminal],
+          errorEvents: history.errorEvents.filter(belongsToRequest),
+        };
       }
       latest = messages;
 
@@ -550,16 +600,18 @@ export class DshClient {
     const waited = await this.waitForSession({
       sessionId: created.sessionId,
       afterSeq: sent.afterSeq,
+      ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
       timeoutMs,
       pollIntervalMs,
     });
     const finalAssistantMessage = [...waited.messages]
       .reverse()
-      .find((message) => message.role === "assistant");
+      .find((message) => message.role === "assistant" && message.text?.trim().length > 0);
     return {
       sessionId: created.sessionId,
       agentPreset: created.agentPreset ?? agentPreset,
       accepted: sent.accepted,
+      ...(sent.requestId === undefined ? {} : { requestId: sent.requestId }),
       status: waited.status,
       completed: waited.completed,
       timedOut: waited.timedOut,
